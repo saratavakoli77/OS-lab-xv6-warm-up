@@ -19,6 +19,14 @@ static void consputc(int);
 
 static int panicked = 0;
 
+#define INPUT_BUF 128
+struct {
+  char buf[INPUT_BUF];
+  uint r;  // Read index
+  uint w;  // Write index
+  uint e;  // Edit index
+  uint end; //end of the buffer
+} input;
 static struct {
   struct spinlock lock;
   int locking;
@@ -126,7 +134,8 @@ panic(char *s)
 //PAGEBREAK: 50
 #define BACKSPACE 0x100
 #define CRTPORT 0x3d4
-#define LEFT_ARROW 228
+#define CURLY_LEFT '{'
+#define CURLY_RIGHT '}'
 static ushort *crt = (ushort*)P2V(0xb8000);  // CGA memory
 
 static void
@@ -145,11 +154,28 @@ cgaputc(int c)
   else if(c == BACKSPACE){
     if(pos > 0) --pos;
   }
-  else if(c == LEFT_ARROW){
-    if(pos > 0) {
-      pos -= pos%80 - 1;
-    }
-  } 
+  else if(c == CURLY_LEFT){
+    // if(input.end > 78 && input.e >78){
+    //     pos -= pos%80 + 80 - 2;
+    // }
+    // else{
+    //   if(pos > 0) {
+    //     pos -= pos%80 - 2;
+    //   }
+    // }
+    pos -= (input.e - input.w);
+  }
+  else if(c == CURLY_RIGHT){
+    // if(input.end > 78){
+    //     pos -= pos%80 + 80 - 2;
+    // }
+    // else{
+    //   if(pos > 0) {
+    //     pos += input.end-input.e;
+    //   }
+    // }
+    pos += input.end-input.e;
+  }
   else
     crt[pos++] = (c&0xff) | 0x0700;  // black on white
 
@@ -166,7 +192,36 @@ cgaputc(int c)
   outb(CRTPORT+1, pos>>8);
   outb(CRTPORT, 15);
   outb(CRTPORT+1, pos);
-  crt[pos] = ' ' | 0x0700;
+  if(c != CURLY_LEFT && input.e == input.end)
+    crt[pos] = ' ' | 0x0700;
+}
+
+void 
+changePos(int change)
+{
+  int pos;
+
+  // Cursor position: col + 80*row.
+  outb(CRTPORT, 14);
+  pos = inb(CRTPORT+1) << 8;
+  outb(CRTPORT, 15);
+  pos |= inb(CRTPORT+1);
+
+  pos += change;
+
+  if(pos < 0 || pos > 25*80)
+    panic("pos under/overflow");
+
+  if((pos/80) >= 24){  // Scroll up.
+    memmove(crt, crt+80, sizeof(crt[0])*23*80);
+    pos -= 80;
+    memset(crt+pos, 0, sizeof(crt[0])*(24*80 - pos));
+  }
+
+  outb(CRTPORT, 14);
+  outb(CRTPORT+1, pos>>8);
+  outb(CRTPORT, 15);
+  outb(CRTPORT+1, pos);
 }
 
 void
@@ -181,23 +236,89 @@ consputc(int c)
   if(c == BACKSPACE){
     uartputc('\b'); uartputc(' '); uartputc('\b');
   }
-  //else if(c == LEFT_ARROW){
-   // uartputc('\b');
-  //} 
   else
     uartputc(c);
   cgaputc(c);
 }
 
-#define INPUT_BUF 128
-struct {
-  char buf[INPUT_BUF];
-  uint r;  // Read index
-  uint w;  // Write index
-  uint e;  // Edit index
-} input;
+
 
 #define C(x)  ((x)-'@')  // Control-x
+
+
+void
+shiftToRight(char* buffer, int end, int start)
+{
+  for(int i = end; i >= start; i--){
+    buffer[i+1] = buffer[i];
+  }
+}
+
+void
+shiftToLeft(char* buffer, int end, int start)
+{
+  for(int i = start; i <= end; i++){
+    buffer[i-1] = buffer[i];
+  }
+}
+
+void
+killLine()
+{
+  changePos(input.end-input.e);
+    input.e = input.end;
+    while(input.end != input.w &&
+          input.buf[(input.e-1) % INPUT_BUF] != '\n'){
+      input.e--;
+      input.end--;
+      consputc(BACKSPACE);
+    }
+}
+
+void
+handleWriteInmid(int c)
+{
+  shiftToRight(input.buf, input.end, input.e);
+  input.buf[input.e % INPUT_BUF] = c;
+  changePos(input.end-input.e);
+  for(int i = input.w; i < input.end; i++){
+    consputc(BACKSPACE);
+  }
+  
+  for(int i = input.w; i <= input.end; i++){
+    consputc(input.buf[i]);
+  }
+  changePos(-(input.end-input.e));
+  input.end++;
+  input.e++;
+}
+
+void
+handleBackspaceInMid()
+{
+  shiftToLeft(input.buf, input.end, input.e);
+  changePos(input.end-input.e);
+  for(int i = input.w; i < input.end; i++){
+    consputc(BACKSPACE);
+  }
+  for(int i = input.w; i < input.end; i++){
+    consputc(input.buf[i]);
+  }
+  changePos(-(input.end-input.e+1));
+  input.end--;
+  input.e--;
+}
+
+void
+finalDecision(int c)
+{
+  if(c == '\n' || c == C('D') || input.end == input.r+INPUT_BUF){
+    changePos(input.end-input.e);
+    input.e = input.end;
+    input.w = input.e;
+    wakeup(&input.r);
+  } 
+}
 
 void
 consoleintr(int (*getc)(void))
@@ -212,40 +333,58 @@ consoleintr(int (*getc)(void))
       doprocdump = 1;
       break;
     case C('U'):  // Kill line.
-      while(input.e != input.w &&
-            input.buf[(input.e-1) % INPUT_BUF] != '\n'){
-        input.e--;
-        consputc(BACKSPACE);
-      }
+      killLine();
+      break;
+    case C('C'):  // Kill line.
+      killLine();
       break;
     case C('H'): case '\x7f':  // Backspace
       if(input.e != input.w){
-        input.e--;
-        consputc(BACKSPACE);
-      }
-      break;
-    // case C(LEFT_ARROW):
-    //   if(input.e != input.w) {
-    //     //input.r--;
-    //    // consputc(c);
-    //     cgaputc(c);
-    //   }
-    //   // while(input.e != input.w &&
-    //   //       input.buf[(input.e-1) % INPUT_BUF] != '\n'){
-    //     // input.r--;
-    //     // consputc(3);
-    //     // }
-    //   break;
-    default:
-      if(c != 0 && input.e-input.r < INPUT_BUF){
-        c = (c == '\r') ? '\n' : c;
-        input.buf[input.e++ % INPUT_BUF] = c;
-        consputc(c);
-        if(c == '\n' || c == C('D') || input.e == input.r+INPUT_BUF){
-          input.w = input.e;
-          wakeup(&input.r);
+        if(input.e < input.end){
+          handleBackspaceInMid();
+        }
+        else{
+          input.e--;
+          input.end--;
+          consputc(BACKSPACE);
         }
       }
+      break;
+    default:
+      if(c != 0 && input.end-input.r < INPUT_BUF){
+        c = (c == '\r') ? '\n' : c;
+        if (c == '\n'){
+          changePos(input.end-input.e);
+          input.e = input.end;
+
+          shiftToRight(input.buf, input.end, input.e);
+          input.buf[input.e++ % INPUT_BUF] = c;
+          input.end++;
+          
+          consputc(c);
+          finalDecision(c);
+        }
+        else if(c == CURLY_LEFT){
+          cgaputc(c);
+          input.e = input.w;
+        }
+        else if(c == CURLY_RIGHT){
+          cgaputc(c);
+          input.e = input.end;
+        }
+        else if(input.e < input.end){
+          handleWriteInmid(c);
+          finalDecision(c);
+        }
+        else{
+          shiftToRight(input.buf, input.end, input.e);
+          input.buf[input.e++ % INPUT_BUF] = c;
+          input.end++;
+          
+          consputc(c);
+          finalDecision(c);
+        } 
+      } 
       break;
     }
   }
